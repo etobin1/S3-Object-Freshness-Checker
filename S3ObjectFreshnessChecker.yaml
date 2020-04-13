@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CF Template for S3FileFreshnessChecker
+Parameters:
+  Bucket:
+    Type: String
+    Description: Name of the S3 bucket intended to check file freshness.
+    AllowedPattern: ^.*[^0-9]$
+  Path:
+    Type: String
+    Description: Prefix for the objects intended to be checked, no leading or trailing slash.
+  EmailAddress:
+    Type: String
+    Description: Email address to send notifications to when Cloudtrail logs haven't been sent recently.
+Outputs:
+  LambdaRoleARN:
+    Description: Role for Lambda execution.
+    Value:
+      Fn::GetAtt:
+        - LambdaRole
+        - Arn
+    Export:
+      Name:
+        Fn::Sub: LambdaRole
+  LambdaFunctionName:
+    Value:
+      Ref: LambdaFunction
+  LambdaFunctionARN:
+    Description: Lambda function ARN.
+    Value:
+      Fn::GetAtt:
+        - LambdaFunction
+        - Arn
+    Export:
+      Name:
+        Fn::Sub: LambdaARN
+Resources:
+  CloudtrailStoppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Alarm if Cloudtrail logs haven't been delivered in over 5 min.
+      Namespace: CloudTrailDeliveryStopped
+      MetricName: FileDeliveryDelay
+      Dimensions:
+      - Name: Time
+        Value: Seconds
+      Statistic: Maximum
+      Period: 900
+      EvaluationPeriods: '1'
+      Threshold: 3000
+      ComparisonOperator: GreaterThanThreshold
+  Topic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: CloudTrail Delivey Failure
+      Subscription:
+      - Endpoint: !Sub
+        - ${Email}
+        - { Email: !Ref EmailAddress }
+        Protocol: email
+  CronEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(0/5 * * * ? *)
+      Targets:
+        - Arn:
+            Fn::GetAtt: [ LambdaFunction , "Arn" ]
+          Id:
+            Ref: LambdaFunction
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::GetAtt: [ LambdaFunction ,"Arn" ]
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt: [ CronEvent , "Arn" ]
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: S3FileFreshnessChecker-lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      Path: /
+      Policies:
+      - PolicyName: CloudWatchLogs-S3FileFreshnessChecker
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: S3-read-only-S3FileFreshnessChecker
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            Resource: !Sub
+              - arn:aws:s3:::${BucketName}/*
+              - { BucketName: !Ref Bucket }
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Sub
+              - arn:aws:s3:::${BucketName}
+              - { BucketName: !Ref Bucket }
+      - PolicyName: LambdaPutMetric-S3FileFreshnessChecker
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  'cloudwatch:namespace': CloudTrailDeliveryStopped
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: S3FileFreshnessChecker
+      Description: LambdaFunction that checks how recent objects have been added to an S3 Bucket
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import datetime
+          import os
+          client = boto3.client('s3')
+          cloudwatch = boto3.client('cloudwatch')
+
+          bucket = os.environ['BUCKET']
+          prefix = os.environ['PATH']
+
+
+          def get_date():
+             dt = datetime.datetime.today()
+             yr = dt.strftime("%Y")
+             mo = dt.strftime("%m")
+             day = dt.strftime("%d")
+             date_prefix = '/' + yr +'/'+ mo +'/' + day+ '/'
+
+             return date_prefix
+
+          def check_freshness(s3_return_obj):
+              json_obj = s3_return_obj
+              lmf_arr = []
+
+              for obj in json_obj['Contents']:
+                  lmf = obj['LastModified']
+                  lmf_arr.append(lmf.strftime('%s'))
+
+              print(len(lmf_arr))
+              return max(lmf_arr)
+
+
+
+          def lambda_handler(event, context):
+              date_prefix = get_date()
+              obj_prefix = prefix+date_prefix
+              response_list = []
+
+              def get_response(bucket, path, *argv):
+                  if len(argv) > 0:
+                      response = client.list_objects_v2(
+                          Bucket=bucket,
+                          Prefix=obj_prefix,
+                          ContinuationToken=argv[0]
+                      )
+                      response_list.append(check_freshness(response))
+                      if 'NextContinuationToken' in response:
+                          token = str(response['NextContinuationToken'])
+                          get_response(bucket, path, token)
+                      else:
+                          return
+
+                  else:
+                      response = client.list_objects_v2(
+                          Bucket=bucket,
+                          Prefix=path
+                      )
+                      response_list.append(check_freshness(response))
+                      if 'NextContinuationToken' in response:
+                          token = str(response['NextContinuationToken'])
+                          get_response(bucket, path, token)
+                      else:
+                          return
+
+
+              get_response(bucket, obj_prefix)
+              last_file_epoch_time  = int(max(response_list))
+              current_time_epoch = int(datetime.datetime.now().timestamp())
+              epoch_time_delta_sec = (current_time_epoch - last_file_epoch_time)
+
+              response = cloudwatch.put_metric_data(
+                  MetricData = [
+                      {
+                          'MetricName': 'FileDeliveryDelay',
+                          'Dimensions': [
+                              {
+                                  'Name': 'Time',
+                                  'Value': 'Seconds'
+                              }
+                          ],
+                          'Unit': 'Seconds',
+                          'Value': epoch_time_delta_sec
+                      },
+                  ],
+                  Namespace = 'CloudTrailDeliveryStopped'
+                  )
+
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 15
+      Role:
+        Fn::GetAtt:
+          - LambdaRole
+          - Arn
+      Environment:
+        Variables:
+          BUCKET:
+            Fn::Sub: ${Bucket}
+          PATH:
+            Fn::Sub: ${Path}
+          TZ: UTC
