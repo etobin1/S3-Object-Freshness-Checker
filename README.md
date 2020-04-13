@@ -21,13 +21,13 @@ S3 Object Freshness Checker is a solution that monitors object freshness in a gi
 
 6. Enter the following details and click **Next**:
 
-  **Stack Name**: Name of the AWS CloudFormation Stack
+    **Stack Name**: Name of the AWS CloudFormation Stack
 
-  **Bucket**: Name of Amazon S3 bucket to monitor  (*Note: This bucket should already exist*)
+    **Bucket**: Name of Amazon S3 bucket to monitor  (*Note: This bucket should already exist*)
 
-  **EmailAddress**: Email address to send alerts to
+    **EmailAddress**: Email address to send alerts to
 
-  **Path**: Object key prefix for objects to be checked.
+    **Path**: Object key prefix for objects to be checked.
 
 7. Optionally, specify tags and click **Next**
 
